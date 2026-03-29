@@ -1,0 +1,107 @@
+"""Therapy lessons router."""
+from fastapi import APIRouter, Depends, HTTPException, status
+from typing import List, Dict
+from ..utils.jwt_handler import get_current_user
+
+
+router = APIRouter(prefix="/api/therapy", tags=["therapy"])
+
+
+# Lesson curriculum data
+LESSONS = [
+    {
+        "id": 1,
+        "type": "letter",
+        "symbol": "அ",
+        "english": "A",
+        "phoneme": "a",
+        "image": "/assets/letters/a.png",
+        "audio": "/assets/sounds/a.mp3",
+        "mouth": "/assets/animations/a_mouth.gif",
+        "tip": "Open mouth wide like saying AH",
+        "difficulty": 1
+    },
+    {
+        "id": 2,
+        "type": "letter",
+        "symbol": "ஆ",
+        "english": "AA",
+        "phoneme": "aa",
+        "image": "/assets/letters/aa.png",
+        "audio": "/assets/sounds/aa.mp3",
+        "mouth": "/assets/animations/aa_mouth.gif",
+        "tip": "Hold the AH sound longer — AAAH",
+        "difficulty": 1
+    },
+    {
+        "id": 3,
+        "type": "letter",
+        "symbol": "ல",
+        "english": "LA",
+        "phoneme": "la",
+        "image": "/assets/letters/la.png",
+        "audio": "/assets/sounds/la.mp3",
+        "mouth": "/assets/animations/la_mouth.gif",
+        "tip": "Touch tongue to roof of mouth",
+        "difficulty": 2
+    },
+    {
+        "id": 4,
+        "type": "letter",
+        "symbol": "த",
+        "english": "TA",
+        "phoneme": "ta",
+        "image": "/assets/letters/ta.png",
+        "audio": "/assets/sounds/ta.mp3",
+        "mouth": "/assets/animations/ta_mouth.gif",
+        "tip": "Tap tongue just behind teeth",
+        "difficulty": 2
+    },
+    {
+        "id": 5,
+        "type": "word",
+        "symbol": "அம்மா",
+        "english": "AMMA",
+        "phoneme": "amma",
+        "image": "/assets/words/amma.png",
+        "audio": "/assets/sounds/amma.mp3",
+        "mouth": "/assets/animations/amma_mouth.gif",
+        "tip": "AH + close lips MM + open AA",
+        "airflow": "low",
+        "candleBlows": False,
+        "difficulty": 3
+    },
+    {
+        "id": 6,
+        "type": "word",
+        "symbol": "அப்பா",
+        "english": "APPA",
+        "phoneme": "appa",
+        "image": "/assets/words/appa.png",
+        "audio": "/assets/sounds/appa.mp3",
+        "mouth": "/assets/animations/appa_mouth.gif",
+        "tip": "AH + burst lips PP + open AA",
+        "airflow": "high",
+        "candleBlows": True,
+        "difficulty": 3
+    }
+]
+
+
+@router.get("/lessons", response_model=List[Dict])
+async def get_lessons(current_user: dict = Depends(get_current_user)):
+    """Get all available lessons."""
+    return LESSONS
+
+
+@router.get("/lessons/{lesson_id}", response_model=Dict)
+async def get_lesson(lesson_id: int, current_user: dict = Depends(get_current_user)):
+    """Get specific lesson by ID."""
+    for lesson in LESSONS:
+        if lesson["id"] == lesson_id:
+            return lesson
+    
+    raise HTTPException(
+        status_code=status.HTTP_404_NOT_FOUND,
+        detail=f"Lesson with ID {lesson_id} not found"
+    )

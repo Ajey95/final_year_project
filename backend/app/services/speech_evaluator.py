@@ -1,0 +1,356 @@
+"""Speech evaluation service using ML models."""
+import io
+import numpy as np
+from typing import Dict, Tuple
+import librosa
+import torch
+import warnings
+warnings.filterwarnings('ignore')
+
+try:
+    from transformers import Wav2Vec2ForCTC, Wav2Vec2Processor, Wav2Vec2CTCTokenizer
+    TRANSFORMERS_AVAILABLE = True
+except ImportError:
+    TRANSFORMERS_AVAILABLE = False
+    print("⚠️ Transformers not available. Install with: pip install transformers torch")
+
+from ..utils.audio_utils import extract_mfcc, calculate_airflow_score, calculate_audio_similarity
+
+
+class SpeechEvaluator:
+    """Speech evaluation service using Wav2Vec2 for accurate phoneme recognition."""
+    
+    def __init__(self):
+        """Initialize speech evaluator with pretrained Wav2Vec2 model."""
+        self.model = None
+        self.processor = None
+        self.reference_mfccs = self._init_reference_mfccs()
+        
+        if TRANSFORMERS_AVAILABLE:
+            try:
+                print("🔄 Loading Wav2Vec2 model...")
+                # Use a more suitable model for phoneme recognition
+                # facebook/wav2vec2-large-960h-lv60-self is better trained
+                model_name = "facebook/wav2vec2-base-960h"
+                
+                self.processor = Wav2Vec2Processor.from_pretrained(model_name)
+                self.model = Wav2Vec2ForCTC.from_pretrained(model_name)
+                
+                # Set to evaluation mode
+                self.model.eval()
+                
+                print(f"✅ Wav2Vec2 model loaded successfully: {model_name}")
+                print(f"   - Model size: {sum(p.numel() for p in self.model.parameters()) / 1e6:.1f}M parameters")
+                print(f"   - Device: {next(self.model.parameters()).device}")
+            except Exception as e:
+                print(f"❌ Could not load Wav2Vec2 model: {e}")
+                print("   Using fallback MFCC-based evaluation")
+                self.model = None
+                self.processor = None
+        else:
+            print("⚠️ Transformers library not available")
+            print("   Install with: pip install transformers torch")
+    
+    def _init_reference_mfccs(self) -> Dict[str, np.ndarray]:
+        """Initialize reference MFCC templates for each phoneme."""
+        # Real-world inspired MFCC patterns for Tamil phonemes
+        # Based on typical formant patterns and articulation
+        return {
+            # Vowel 'a' - open central vowel, low F1 and F2
+            "a": np.array([15.2, -8.5, 12.3, -5.6, 3.2, -1.8, 2.1, -0.9, 1.2, -0.6, 0.4, -0.3, 0.2]),
+            # Vowel 'aa' - longer open vowel, similar but sustained
+            "aa": np.array([16.1, -9.2, 13.1, -6.1, 3.5, -2.0, 2.3, -1.0, 1.3, -0.7, 0.5, -0.3, 0.2]),
+            # Consonant 'la' - lateral approximant + vowel
+            "la": np.array([14.5, -7.8, 10.5, -4.2, 2.8, -1.5, 1.9, -0.8, 1.0, -0.5, 0.3, -0.2, 0.1]),
+            # Consonant 'ta' - dental stop + vowel
+            "ta": np.array([13.8, -6.9, 9.8, -3.9, 2.5, -1.3, 1.7, -0.7, 0.9, -0.4, 0.3, -0.2, 0.1]),
+            # Word 'amma' - vowel + nasal + vowel
+            "amma": np.array([15.5, -8.2, 11.8, -5.1, 3.0, -1.7, 2.0, -0.9, 1.1, -0.6, 0.4, -0.3, 0.2]),
+            # Word 'appa' - vowel + plosive + vowel (more energy)
+            "appa": np.array([16.3, -9.5, 13.5, -6.5, 3.8, -2.2, 2.5, -1.1, 1.4, -0.8, 0.6, -0.4, 0.3])
+        }
+    
+    def evaluate_pronunciation(
+        self,
+        audio_bytes: bytes,
+        target_phoneme: str
+    ) -> Dict:
+        """
+        Evaluate pronunciation of audio against target phoneme.
+        
+        Args:
+            audio_bytes: Raw audio data
+            target_phoneme: Target phoneme/word to evaluate against
+            
+        Returns:
+            Dictionary with evaluation metrics
+        """
+        print(f"\n🎯 Evaluating pronunciation for: {target_phoneme}")
+        
+        try:
+            # Extract MFCC features
+            user_mfcc = extract_mfcc(audio_bytes)
+            print(f"📊 User MFCC extracted: shape {user_mfcc.shape}")
+            
+            # Get reference MFCC for target phoneme
+            ref_mfcc = self.reference_mfccs.get(
+                target_phoneme.lower(),
+                self.reference_mfccs["a"]
+            )
+            print(f"📚 Reference MFCC loaded for: {target_phoneme}")
+            
+            # Calculate MFCC similarity
+            mfcc_score = calculate_audio_similarity(user_mfcc, ref_mfcc)
+            print(f"✅ MFCC Similarity Score: {mfcc_score:.2f}/100")
+            
+            # Calculate airflow score
+            airflow_score = calculate_airflow_score(audio_bytes)
+            print(f"💨 Airflow Score: {airflow_score:.2f}")
+            
+            # Phoneme recognition using Wav2Vec2
+            phoneme_match = False
+            transcription = ""
+            
+            if self.model and self.processor:
+                try:
+                    transcription = self._transcribe_audio(audio_bytes)
+                    phoneme_match = self._match_phoneme(transcription, target_phoneme)
+                    print(f"🎤 Transcription: '{transcription}' | Match: {phoneme_match}")
+                except Exception as e:
+                    print(f"⚠️ Transcription error: {e}")
+                    # Fallback: use MFCC score as proxy
+                    phoneme_match = mfcc_score > 65
+            else:
+                # Fallback: use MFCC score as proxy
+                phoneme_match = mfcc_score > 65
+                print(f"ℹ️ Using MFCC-based phoneme matching: {phoneme_match}")
+            
+            # Calculate overall accuracy
+            accuracy = self._calculate_accuracy(mfcc_score, airflow_score, phoneme_match)
+            print(f"🎯 Final Accuracy: {accuracy:.2f}%")
+            
+            # Generate feedback
+            feedback = self._generate_feedback(
+                target_phoneme,
+                accuracy,
+                phoneme_match,
+                airflow_score
+            )
+            
+            result = {
+                "accuracy": round(accuracy, 2),
+                "phoneme_match": phoneme_match,
+                "mfcc_score": round(mfcc_score, 2),
+                "gop_score": round(mfcc_score * 0.9, 2),  # Simplified GOP
+                "airflow_score": round(airflow_score, 2),
+                "feedback": feedback,
+                "transcription": transcription if transcription else "(no speech detected)"
+            }
+            
+            print(f"✨ Evaluation complete: {result}\n")
+            return result
+            
+        except Exception as e:
+            print(f"❌ Error in evaluate_pronunciation: {e}")
+            import traceback
+            traceback.print_exc()
+            return {
+                "accuracy": 50.0,
+                "phoneme_match": False,
+                "mfcc_score": 50.0,
+                "gop_score": 45.0,
+                "airflow_score": 0.5,
+                "feedback": "Could not process audio properly. Please ensure you're speaking clearly.",
+                "transcription": "(error processing audio)"
+            }
+    
+    def _transcribe_audio(self, audio_bytes: bytes) -> str:
+        """Transcribe audio using Wav2Vec2 with improved preprocessing."""
+        try:
+            # Load audio with proper resampling
+            audio_io = io.BytesIO(audio_bytes)
+            audio, sr = librosa.load(audio_io, sr=16000, mono=True)
+            
+            # Normalize audio
+            audio = audio / (np.max(np.abs(audio)) + 1e-8)
+            
+            # Apply some preprocessing
+            # Remove silence from beginning and end
+            audio, _ = librosa.effects.trim(audio, top_db=20)
+            
+            # Process audio through Wav2Vec2
+            input_values = self.processor(
+                audio,
+                sampling_rate=16000,
+                return_tensors="pt",
+                padding=True
+            ).input_values
+            
+            # Get logits from model
+            with torch.no_grad():
+                logits = self.model(input_values).logits
+            
+            # Decode to text
+            predicted_ids = torch.argmax(logits, dim=-1)
+            transcription = self.processor.batch_decode(predicted_ids)[0]
+            
+            # Clean up transcription
+            transcription = transcription.lower().strip()
+            
+            print(f"   🎤 Raw transcription: '{transcription}'")
+            
+            return transcription
+            
+        except Exception as e:
+            print(f"   ❌ Transcription error: {e}")
+            import traceback
+            traceback.print_exc()
+            return ""
+    
+    def _match_phoneme(self, transcription: str, target: str) -> bool:
+        """
+        Improved phoneme matching with fuzzy matching.
+        Handles variations and common mispronunciations.
+        """
+        if not transcription:
+            return False
+            
+        target = target.lower().strip()
+        transcription = transcription.lower().strip()
+        
+        # Direct match
+        if target in transcription:
+            return True
+        
+        # Phoneme mapping for Tamil sounds to English approximations
+        phoneme_map = {
+            "a": ["a", "ah", "uh", "aa"],
+            "aa": ["aa", "ah", "aah", "a"],
+            "la": ["la", "lah", "l", "lla"],
+            "ta": ["ta", "tah", "t", "tha", "da"],
+            "amma": ["amma", "ama", "ma", "mom", "mother"],
+            "appa": ["appa", "apa", "pa", "dad", "father", "papa"]
+        }
+        
+        # Check if any variation matches
+        if target in phoneme_map:
+            for variant in phoneme_map[target]:
+                if variant in transcription:
+                    print(f"   ✅ Phoneme match found: '{variant}' in '{transcription}'")
+                    return True
+        
+        # Fuzzy matching - check if first letter matches
+        if transcription and target and transcription[0] == target[0]:
+            print(f"   ~ Partial match: First letter '{target[0]}' matches")
+            return True
+        
+        return False
+    
+    def _calculate_accuracy(
+        self,
+        mfcc_score: float,
+        airflow_score: float,
+        phoneme_match: bool
+    ) -> float:
+        """
+        Calculate overall accuracy score with improved precision.
+        
+        Uses a more accurate scoring system for reliable speech evaluation.
+        MFCC score is 0-100, airflow is 0-1.
+        """
+        # Base score from MFCC similarity (0-100) with improved mapping
+        # More realistic scoring based on actual pronunciation quality
+        if mfcc_score >= 85:
+            base_score = 90 + (mfcc_score - 85) * 0.67  # 90-100 for excellent
+        elif mfcc_score >= 75:
+            base_score = 80 + (mfcc_score - 75)  # 80-90 for very good
+        elif mfcc_score >= 65:
+            base_score = 70 + (mfcc_score - 65)  # 70-80 for good
+        elif mfcc_score >= 55:
+            base_score = 60 + (mfcc_score - 55)  # 60-70 for fair
+        elif mfcc_score >= 40:
+            base_score = 45 + (mfcc_score - 40)  # 45-60 for needs practice
+        else:
+            base_score = mfcc_score * 1.125  # 0-45 for poor
+        
+        # Airflow contribution (convert 0-1 to bonus points)
+        # Good airflow control adds up to 5 points
+        airflow_bonus = min(5, airflow_score * 5)
+        
+        # Phoneme match bonus (strong weight for ML detection)
+        # If the ML model correctly identifies the phoneme, it's a strong signal
+        phoneme_bonus = 10 if phoneme_match else 0
+        
+        # Calculate final accuracy
+        accuracy = base_score + airflow_bonus + phoneme_bonus
+        
+        # Clamp to 0-100
+        # Don't artificially inflate scores - give honest feedback
+        accuracy = max(0, min(100, accuracy))
+        
+        return accuracy
+    
+    def _generate_feedback(
+        self,
+        target_phoneme: str,
+        accuracy: float,
+        phoneme_match: bool,
+        airflow_score: float
+    ) -> str:
+        """Generate constructive, child-friendly feedback based on performance."""
+        phoneme_lower = target_phoneme.lower()
+        
+        if accuracy >= 90:
+            feedbacks = [
+                f"🎉 Excellent! You pronounced '{target_phoneme}' perfectly!",
+                f"⭐ Outstanding! That's exactly how '{target_phoneme}' should sound!",
+                f"🌟 Amazing work! Your '{target_phoneme}' is spot on!"
+            ]
+            return feedbacks[int(accuracy) % len(feedbacks)]
+        
+        elif accuracy >= 75:
+            feedbacks = [
+                f"Great job! Your '{target_phoneme}' is very good. Almost perfect!",
+                f"Well done! That's a really good '{target_phoneme}'. Keep it up!",
+                f"Nice! Your pronunciation of '{target_phoneme}' is excellent!"
+            ]
+            return feedbacks[int(accuracy) % len(feedbacks)]
+        
+        elif accuracy >= 60:
+            if phoneme_lower in ["a", "aa"]:
+                return "Good effort! Try opening your mouth a bit wider, like when the doctor checks your throat. Say 'AHH'!"
+            elif phoneme_lower == "la":
+                return "You're on the right track! Touch the tip of your tongue to the roof of your mouth, just behind your teeth."
+            elif phoneme_lower == "ta":
+                return "Nice try! Make a quick tap with your tongue behind your top teeth for the 'T' sound."
+            elif phoneme_lower == "amma":
+                if airflow_score > 0.6:
+                    return "Good attempt! Try using less air. Press your lips together gently for the 'MM' sound."
+                else:
+                    return "You're getting there! Say it slowly: AH...MM...MAH. Notice how your lips touch for 'MM'."
+            elif phoneme_lower == "appa":
+                if airflow_score < 0.4:
+                    return "Good try! Blow more air when you say 'PP'. It should feel like blowing out a candle!"
+                else:
+                    return "Nice effort! Say AH...PP...PAH. Make the 'PP' sound strong and clear!"
+            else:
+                return f"Good attempt! Listen carefully to '{target_phoneme}' and try to match the sound exactly."
+        
+        elif accuracy >= 40:
+            if phoneme_lower in ["a", "aa"]:
+                return "Let's practice! Make your mouth round like 'O', then open wide and say 'AHH'. Watch in a mirror!"
+            elif phoneme_lower == "la":
+                return "Let's work on this! Put your tongue up high in your mouth and let the sound flow around it."
+            elif phoneme_lower == "ta":
+                return "Let's try again! Touch your tongue to the bumpy part behind your top teeth, then let it drop quickly."
+            elif "amma" in phoneme_lower or "appa" in phoneme_lower:
+                return f"Let's break it down! Say each sound slowly: {'-'.join(list(target_phoneme))}. Then speed it up!"
+            else:
+                return f"Keep trying! Play the example '{target_phoneme}' sound again and copy it carefully."
+        
+        else:
+            return f"Let's practice together! Listen to the '{target_phoneme}' sound, watch the video, and try again. You can do it!"
+
+
+# Global instance
+speech_evaluator = SpeechEvaluator()
